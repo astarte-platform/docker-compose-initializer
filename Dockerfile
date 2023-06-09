@@ -11,7 +11,7 @@ RUN curl -L -o /deps/cfssl https://github.com/cloudflare/cfssl/releases/download
   tar xf /deps/astartectl_22.11.02_linux_x86_64.tar.gz && \
   chmod +x /deps/astartectl
 
-FROM debian:buster-slim
+FROM debian:bullseye-slim
 
 RUN apt-get update && apt-get install openssl -y && apt-get clean autoclean && \
   apt-get autoremove --yes && rm -rf /var/lib/{apt,dpkg,cache,log}/
