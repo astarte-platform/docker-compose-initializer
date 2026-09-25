@@ -1,36 +1,103 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+set -eEuo pipefail
+
+# Trap -e errors
+trap 'echo "Exit status $? at line $LINENO from: $BASH_COMMAND"' ERR
 
 # Generate keys if necessary
-if [ ! -f /compose/cfssl-config/ca.pem ] || [ ! -f /compose/cfssl-config/ca-key.pem ] ; then
-	cd /compose/cfssl-config/
-	cfssl gencert -initca "csr_root_ca.json" | cfssljson -bare ca
-	cd -
+if [ ! -f /compose/cfssl-config/ca.pem ] || [ ! -f /compose/cfssl-config/ca-key.pem ]; then
+    mkdir -p /compose/cfssl-config/
+    pushd /compose/cfssl-config/
+
+    cfssl gencert -initca "csr_root_ca.json" | cfssljson -bare ca
+
+    popd
 fi
 
 # Generate housekeeping keypairs
-if [ ! -f /compose/astarte-keys/housekeeping_public.pem ] ; then
-    cd /compose/astarte-keys/
+if [ ! -f /compose/astarte-keys/housekeeping_public.pem ]; then
+    mkdir -p /compose/astarte-keys
+    pushd /compose/astarte-keys/
+
     astartectl utils gen-keypair housekeeping
-    cd -
+
+    popd
+fi
+
+# Generate TLS CA and certificates
+dir=/compose/certificates
+san_yaml='[SAN]
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = astarte.localhost
+DNS.2 = *.astarte.localhost
+DNS.3 = edgehog.localhost
+DNS.4 = *.edgehog.localhost
+
+[req]
+req_extensions = v3_req
+'
+
+mkdir -p $dir
+
+if [[ ! -f $dir/ca.key ]]; then
+    openssl ecparam -name secp384r1 -genkey -out $dir/ca.key -noout
+fi
+
+if [[ ! -f $dir/ca.csr ]]; then
+    openssl req -new \
+        -key $dir/ca.key \
+        -out $dir/ca.csr \
+        -subj "/C=IT/O=Astarte Internal/CN=Astarte Root CA"
+fi
+
+if [[ ! -f $dir/ca.crt ]]; then
+    openssl x509 -req \
+        -in $dir/ca.csr \
+        -out $dir/ca.crt \
+        -signkey $dir/ca.key \
+        -days 3650 -sha256 \
+        -extfile <(printf "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
+fi
+
+if [[ ! -f $dir/tls.key ]]; then
+    openssl ecparam -name secp384r1 -genkey -noout -out $dir/tls.key
+
+    openssl req -new -key $dir/tls.key -out $dir/tls.csr \
+        -subj "/C=IT/O=Astarte Internal/CN=api.astarte.localhost"
+
+    openssl x509 -req -in $dir/tls.csr -out $dir/tls.crt -CA $dir/ca.crt -CAkey $dir/ca.key -days 3650 \
+        -extensions v3_req \
+        -extensions SAN \
+        -extfile <(cat /etc/ssl/openssl.cnf <(printf "%s" "$san_yaml"))
+
+    openssl verify -CAfile $dir/ca.crt $dir/tls.crt
+
+    openssl x509 -in $dir/tls.crt -inform pem -noout -text
 fi
 
 # Generate self-signed VerneMQ certificate if necessary
-if [ ! -f /compose/vernemq-certs/cert ] ; then
-	cd /compose/vernemq-certs/
-	# Structure
-	mkdir -p ca/certs ca/crl ca/newcerts ca/private
-	touch ca/index.txt
-	touch ca/index.txt.attr
-	echo 1000 > ca/serial
+if [ ! -f /compose/vernemq-certs/cert ]; then
+    mkdir -p /compose/vernemq-certs/
+    pushd /compose/vernemq-certs/
 
-	# The root CA
-	openssl genrsa -out ca/private/ca.key.pem 2048
-	openssl req -config openssl.cnf -key ca/private/ca.key.pem -new -x509 -days 7300 -sha256 -extensions v3_ca -out ca/certs/ca.cert.pem -subj "/C=IT/O=Astarte Internal/CN=Root CA/"
+    mkdir -p ca/certs ca/crl ca/newcerts ca/private
 
-	openssl req -config openssl.cnf -nodes -newkey rsa:2048 -keyout privkey -out server.csr -subj "/C=IT/O=Astarte Internal/CN=vernemq/"
-	openssl ca -batch -config openssl.cnf -extensions server_cert -days 3750 -notext -md sha256 -in server.csr -out server.crt
+    # Structure
+    touch ca/index.txt
+    touch ca/index.txt.attr
+    echo 1000 >ca/serial
 
-	# Generate VMQ-friendly certificate with the whole chain
-	cat server.crt ca/certs/ca.cert.pem > cert
-	cd -
+    cp -v $dir/tls.key privkey
+    cp -v $dir/tls.crt server.crt
+
+    # Generate VMQ-friendly certificate with the whole chain
+    cat server.crt $dir/ca.crt >cert
+
+    popd
 fi
